@@ -14,21 +14,20 @@ void train_bpe(Vocabulary *vocab, TokenSequence *seq, int target_vocab_size, Mer
 
   int initial_length = seq->length;
 
+  PairHashTable table = create_pair_table(10000);
   while (vocab->size < target_vocab_size) {
     // Count all pairs using hash table
-    PairHashTable table = create_pair_table(10000);
+    clear_pair_table(&table);
     count_pairs_hash(seq, &table);
 
     if (table.size == 0) {
       printf("No more pairs to merge!\n");
-      free_pair_table(&table);
       break;
     }
 
     // Find best pair
     PairNode* best = find_best_pair_in_table(&table);
     if (best == NULL) {
-      free_pair_table(&table);
       break;
     }
 
@@ -53,10 +52,10 @@ void train_bpe(Vocabulary *vocab, TokenSequence *seq, int target_vocab_size, Mer
     // Update sequence
     merge_pair_in_sequence(seq, best->token1, best->token2, new_idx);
 
-    // Clean up hash table
-    free_pair_table(&table);
     free_token(&merged);
   }
+
+  free_pair_table(&table);
 
   printf("\nTraining complete!\n");
   printf("Final vocab size: %d\n", vocab->size);

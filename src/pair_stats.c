@@ -22,7 +22,7 @@ PairHashTable create_pair_table(int num_buckets) {
 }
 
 
-void free_pair_table(PairHashTable *table) {
+void clear_pair_table(PairHashTable *table) {
   for (int i = 0; i < table->num_buckets; i++) {
     PairNode *node = table->buckets[i];
     while (node != NULL) {
@@ -30,7 +30,13 @@ void free_pair_table(PairHashTable *table) {
       free(node);
       node = next;
     }
+    table->buckets[i] = NULL;
   }
+  table->size = 0;
+}
+
+void free_pair_table(PairHashTable *table) {
+  clear_pair_table(table);
   free(table->buckets);
   table->buckets = NULL;
   table->size = 0;

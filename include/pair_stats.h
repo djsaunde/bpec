@@ -17,6 +17,7 @@ typedef struct {
 } PairHashTable;
 
 PairHashTable create_pair_table(int num_buckets);
+void clear_pair_table(PairHashTable *table);
 void free_pair_table(PairHashTable *table);
 void increment_pair(PairHashTable *table, int token1, int token2);
 PairNode* find_best_pair_in_table(PairHashTable *table);
