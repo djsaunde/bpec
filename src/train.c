@@ -2,12 +2,16 @@
 #include "vocab.h"
 #include "sequence.h"
 #include "merge_rules.h"
+#include "pair_heap.h"
 #include "token.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 
 typedef struct SeqNode {
   int token_id;
@@ -25,16 +29,6 @@ typedef struct PairOccurrence {
   int active;
 } PairOccurrence;
 
-typedef struct PairEntry {
-  int token_left;
-  int token_right;
-  int count;
-  int heap_index;
-  int occ_head;
-  int next_free;
-  int in_use;
-} PairEntry;
-
 typedef struct {
   PairOccurrence *items;
   int size;
@@ -50,10 +44,37 @@ typedef struct {
 } PairMap;
 
 typedef struct {
-  int *data;
-  int size;
-  int capacity;
-} PairHeap;
+  atomic_int merges_done;
+  atomic_int finished;
+  int total_merges;
+} ProgressTracker;
+
+static void* progress_thread_main(void *arg) {
+  ProgressTracker *tracker = (ProgressTracker*)arg;
+  int last_reported = -1;
+  int total = tracker->total_merges;
+  const struct timespec interval = {0, 200000000L};
+
+  while (!atomic_load_explicit(&tracker->finished, memory_order_relaxed)) {
+    int done = atomic_load_explicit(&tracker->merges_done, memory_order_relaxed);
+    if (done != last_reported && total > 0) {
+      double percent = (100.0 * done) / total;
+      fprintf(stderr, "\rTraining progress: %d/%d merges (%.1f%%)", done, total, percent);
+      fflush(stderr);
+      last_reported = done;
+    }
+    nanosleep(&interval, NULL);
+  }
+
+  int done = atomic_load_explicit(&tracker->merges_done, memory_order_relaxed);
+  if (total > 0) {
+    double percent = (100.0 * done) / total;
+    fprintf(stderr, "\rTraining progress: %d/%d merges (%.1f%%)\n", done, total, percent);
+    fflush(stderr);
+  }
+
+  return NULL;
+}
 
 typedef struct {
   SeqNode *nodes;
@@ -258,125 +279,6 @@ static void pair_map_remove(PairMap *map, uint64_t key) {
   }
 }
 
-static void heap_init(PairHeap *heap, int capacity_hint) {
-  heap->capacity = capacity_hint > 0 ? capacity_hint : 16;
-  heap->size = 0;
-  heap->data = malloc(sizeof(int) * heap->capacity);
-  if (!heap->data) {
-    fprintf(stderr, "Failed to allocate pair heap\n");
-    exit(1);
-  }
-}
-
-static void heap_free(PairHeap *heap) {
-  free(heap->data);
-  heap->data = NULL;
-  heap->capacity = 0;
-  heap->size = 0;
-}
-
-static void heap_reserve(PairHeap *heap, int min_capacity) {
-  if (heap->capacity >= min_capacity)
-    return;
-  int new_cap = heap->capacity ? heap->capacity : 16;
-  while (new_cap < min_capacity)
-    new_cap *= 2;
-  int *new_data = realloc(heap->data, sizeof(int) * new_cap);
-  if (!new_data) {
-    fprintf(stderr, "Failed to grow pair heap\n");
-    exit(1);
-  }
-  heap->data = new_data;
-  heap->capacity = new_cap;
-}
-
-static void heap_swap(PairHeap *heap, TrainerState *state, int a, int b) {
-  int pa = heap->data[a];
-  int pb = heap->data[b];
-  heap->data[a] = pb;
-  heap->data[b] = pa;
-  state->pairs[pa].heap_index = b;
-  state->pairs[pb].heap_index = a;
-}
-
-static void heap_sift_up(PairHeap *heap, TrainerState *state, int idx) {
-  while (idx > 0) {
-    int parent = (idx - 1) / 2;
-    int current_pair = heap->data[idx];
-    int parent_pair = heap->data[parent];
-    if (state->pairs[current_pair].count <= state->pairs[parent_pair].count)
-      break;
-    heap_swap(heap, state, idx, parent);
-    idx = parent;
-  }
-}
-
-static void heap_sift_down(PairHeap *heap, TrainerState *state, int idx) {
-  while (1) {
-    int left = idx * 2 + 1;
-    int right = left + 1;
-    int largest = idx;
-
-    if (left < heap->size &&
-        state->pairs[heap->data[left]].count > state->pairs[heap->data[largest]].count)
-      largest = left;
-    if (right < heap->size &&
-        state->pairs[heap->data[right]].count > state->pairs[heap->data[largest]].count)
-      largest = right;
-    if (largest == idx)
-      break;
-    heap_swap(heap, state, idx, largest);
-    idx = largest;
-  }
-}
-
-static void heap_push(PairHeap *heap, TrainerState *state, int pair_index) {
-  heap_reserve(heap, heap->size + 1);
-  heap->data[heap->size] = pair_index;
-  state->pairs[pair_index].heap_index = heap->size;
-  heap->size++;
-  heap_sift_up(heap, state, heap->size - 1);
-}
-
-static void heap_remove_at(PairHeap *heap, TrainerState *state, int idx) {
-  int last = heap->size - 1;
-  int pair_idx = heap->data[idx];
-  heap->size--;
-  if (idx != last) {
-    heap->data[idx] = heap->data[last];
-    state->pairs[heap->data[idx]].heap_index = idx;
-    heap_sift_down(heap, state, idx);
-    heap_sift_up(heap, state, idx);
-  }
-  state->pairs[pair_idx].heap_index = -1;
-}
-
-static void heap_update(PairHeap *heap, TrainerState *state, int pair_index) {
-  PairEntry *entry = &state->pairs[pair_index];
-  if (entry->count <= 0) {
-    if (entry->heap_index != -1)
-      heap_remove_at(heap, state, entry->heap_index);
-    entry->heap_index = -1;
-    return;
-  }
-
-  if (entry->heap_index == -1) {
-    heap_push(heap, state, pair_index);
-  } else {
-    int idx = entry->heap_index;
-    heap_sift_up(heap, state, idx);
-    heap_sift_down(heap, state, idx);
-  }
-}
-
-static int heap_pop_max(PairHeap *heap, TrainerState *state) {
-  if (heap->size == 0)
-    return -1;
-  int top = heap->data[0];
-  heap_remove_at(heap, state, 0);
-  return top;
-}
-
 static void trainer_pairs_grow(TrainerState *state) {
   int new_cap = state->pair_capacity ? state->pair_capacity * 2 : 32;
   PairEntry *new_pairs = realloc(state->pairs, sizeof(PairEntry) * new_cap);
@@ -505,7 +407,7 @@ static void pair_entry_remove_occurrence(TrainerState *state, int occ_index, int
   occ_pool_release(&state->occ_pool, occ_index);
 
   if (update_heap)
-    heap_update(&state->heap, state, pair_index);
+    pair_heap_update(&state->heap, state->pairs, pair_index);
 }
 
 static void trainer_detach_occurrence_for_node(TrainerState *state, int node_index) {
@@ -569,7 +471,7 @@ static void trainer_add_pair_for_node(TrainerState *state, int node_index) {
   entry->count++;
   left->occ_index = occ_idx;
 
-  heap_update(&state->heap, state, pair_index);
+  pair_heap_update(&state->heap, state->pairs, pair_index);
 }
 
 static void trainer_merge_pair(TrainerState *state, int pair_index, int new_token_id) {
@@ -631,7 +533,7 @@ static void trainer_state_init(TrainerState *state, TokenSequence *seq) {
   occ_pool_init(&state->occ_pool, hint);
   pair_map_init(&state->map, hint * 2);
   trainer_pairs_init(state, hint);
-  heap_init(&state->heap, hint);
+  pair_heap_init(&state->heap, hint);
 
   for (int idx = state->head; idx != -1; idx = state->nodes[idx].next)
     trainer_add_pair_for_node(state, idx);
@@ -646,7 +548,7 @@ static void trainer_state_free(TrainerState *state) {
 
   occ_pool_free(&state->occ_pool);
   pair_map_free(&state->map);
-  heap_free(&state->heap);
+  pair_heap_free(&state->heap);
   free(state->pairs);
   state->pairs = NULL;
   state->pair_capacity = 0;
@@ -663,13 +565,28 @@ void train_bpe(Vocabulary *vocab, TokenSequence *seq, int target_vocab_size, Mer
   TrainerState state;
   trainer_state_init(&state, seq);
 
+  int merges_goal = target_vocab_size > vocab->size ? (target_vocab_size - vocab->size) : 0;
+  ProgressTracker tracker;
+  pthread_t progress_thread;
+  int progress_started = 0;
+  if (merges_goal > 0) {
+    atomic_init(&tracker.merges_done, 0);
+    atomic_init(&tracker.finished, 0);
+    tracker.total_merges = merges_goal;
+    if (pthread_create(&progress_thread, NULL, progress_thread_main, &tracker) == 0) {
+      progress_started = 1;
+    } else {
+      fprintf(stderr, "Warning: unable to start progress reporter; continuing without live progress.\n");
+    }
+  }
+
   while (vocab->size < target_vocab_size) {
     if (state.live_count < 2) {
       printf("No more pairs to merge!\n");
       break;
     }
 
-    int pair_index = heap_pop_max(&state.heap, &state);
+    int pair_index = pair_heap_pop_max(&state.heap, state.pairs);
     if (pair_index == -1) {
       printf("No more pairs to merge!\n");
       break;
@@ -677,24 +594,16 @@ void train_bpe(Vocabulary *vocab, TokenSequence *seq, int target_vocab_size, Mer
 
     PairEntry *entry = &state.pairs[pair_index];
     if (!entry->in_use || entry->count == 0) {
+      pair_heap_remove(&state.heap, state.pairs, pair_index);
       trainer_release_pair_entry(&state, pair_index);
       continue;
     }
 
     int left_token = entry->token_left;
     int right_token = entry->token_right;
-    int occurrence_count = entry->count;
 
     Token merged = merge_tokens(&vocab->tokens[left_token],
                                  &vocab->tokens[right_token]);
-
-    printf("Merge %d: ", vocab->size - 256);
-    print_token(&vocab->tokens[left_token]);
-    printf(" + ");
-    print_token(&vocab->tokens[right_token]);
-    printf(" → ");
-    print_token(&merged);
-    printf(" (count: %d)\n", occurrence_count);
 
     int new_idx = add_token(vocab, merged.bytes, merged.length);
     add_merge_rule(merge_rules, left_token, right_token, new_idx);
@@ -702,8 +611,16 @@ void train_bpe(Vocabulary *vocab, TokenSequence *seq, int target_vocab_size, Mer
     trainer_merge_pair(&state, pair_index, new_idx);
 
     pair_map_remove(&state.map, make_pair_key(left_token, right_token));
+    pair_heap_remove(&state.heap, state.pairs, pair_index);
     trainer_release_pair_entry(&state, pair_index);
+    if (progress_started)
+      atomic_fetch_add_explicit(&tracker.merges_done, 1, memory_order_relaxed);
     free_token(&merged);
+  }
+
+  if (progress_started) {
+    atomic_store_explicit(&tracker.finished, 1, memory_order_relaxed);
+    pthread_join(progress_thread, NULL);
   }
 
   int pos = 0;

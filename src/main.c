@@ -1,30 +1,42 @@
+#include "cli.h"
 #include "vocab.h"
 #include "sequence.h"
 #include "merge_rules.h"
 #include "train.h"
 #include "io.h"
 #include "token.h"
+
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 
-int main() {
+int main(int argc, char **argv) {
+  int target_vocab_size;
+  const char *input_path;
+  int parse_result = parse_cli_args(argc, argv, &target_vocab_size, &input_path);
+  if (parse_result != 0) {
+    return parse_result > 0 ? 0 : 1;
+  }
+
   printf("BPE Tokenizer\n\n");
-  
-  // Download the file first using curl or wget
-  printf("Make sure you've downloaded tiny shakespeare:\n");
-  printf("curl -O https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt\n\n");
-  
-  // Initialize vocabulary
-  int target_vocab_size = 512;
+  printf("Training corpus: %s\n", input_path);
+  printf("Target vocabulary size: %d\n\n", target_vocab_size);
+
+  if (target_vocab_size < 256) {
+    fprintf(stderr, "Target vocabulary must be at least 256 (base tokens).\n");
+    return 1;
+  }
+
   Vocabulary vocab = create_vocab(target_vocab_size);
   init_base_vocab(&vocab);
-  
+
   // Read training data
   int text_len;
-  uint8_t *text = read_file("input.txt", &text_len);
+  uint8_t *text = read_file(input_path, &text_len);
   if (text == NULL) {
+    fprintf(stderr, "Failed to load training data from %s\n", input_path);
+    free_vocab(&vocab);
     return 1;
   }
   
