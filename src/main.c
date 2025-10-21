@@ -5,6 +5,7 @@
 #include "train.h"
 #include "io.h"
 #include "token.h"
+#include "tokenizer_io.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -12,44 +13,61 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
-  int target_vocab_size;
-  const char *input_path;
-  int parse_result = parse_cli_args(argc, argv, &target_vocab_size, &input_path);
+  CliOptions options;
+  int parse_result = parse_cli_args(argc, argv, &options);
   if (parse_result != 0) {
     return parse_result > 0 ? 0 : 1;
   }
 
+  Vocabulary vocab;
+  MergeRules merge_rules;
+  uint8_t *text = NULL;
+  int text_len = 0;
+  TokenSequence seq;
+  int seq_initialised = 0;
+
   printf("BPE Tokenizer\n\n");
-  printf("Training corpus: %s\n", input_path);
-  printf("Target vocabulary size: %d\n\n", target_vocab_size);
 
-  if (target_vocab_size < 256) {
-    fprintf(stderr, "Target vocabulary must be at least 256 (base tokens).\n");
-    return 1;
+  if (options.load_path != NULL) {
+    if (load_tokenizer(options.load_path, &vocab, &merge_rules) != 0) {
+      fprintf(stderr, "Failed to load tokenizer from %s\n", options.load_path);
+      return 1;
+    }
+    printf("Loaded tokenizer from %s\n", options.load_path);
+    printf("Vocabulary size: %d\n", vocab.size);
+    printf("Merge rules: %d\n\n", merge_rules.num_rules);
+  } else {
+    printf("Training corpus: %s\n", options.input_path);
+    printf("Target vocabulary size: %d\n\n", options.target_vocab_size);
+
+    vocab = create_vocab(options.target_vocab_size);
+    init_base_vocab(&vocab);
+
+    text = read_file(options.input_path, &text_len);
+    if (text == NULL) {
+      fprintf(stderr, "Failed to load training data from %s\n", options.input_path);
+      free_vocab(&vocab);
+      return 1;
+    }
+
+    printf("Loaded training text\n");
+    printf("Text length: %d bytes\n\n", text_len);
+
+    seq = text_to_sequence(text, text_len);
+    seq_initialised = 1;
+
+    merge_rules = create_merge_rules(options.target_vocab_size - 256);
+    train_bpe(&vocab, &seq, options.target_vocab_size, &merge_rules);
   }
 
-  Vocabulary vocab = create_vocab(target_vocab_size);
-  init_base_vocab(&vocab);
-
-  // Read training data
-  int text_len;
-  uint8_t *text = read_file(input_path, &text_len);
-  if (text == NULL) {
-    fprintf(stderr, "Failed to load training data from %s\n", input_path);
-    free_vocab(&vocab);
-    return 1;
+  if (options.save_path != NULL) {
+    if (save_tokenizer(options.save_path, &vocab, &merge_rules) != 0) {
+      fprintf(stderr, "Failed to save tokenizer to %s\n", options.save_path);
+    } else {
+      printf("Tokenizer saved to %s\n", options.save_path);
+    }
   }
-  
-  printf("Loaded training text\n");
-  printf("Text length: %d bytes\n\n", text_len);
 
-  // From uint8_t to int
-  TokenSequence seq = text_to_sequence(text, text_len);
-
-  // Train BPE with target vocab size (+ record merge rules)
-  MergeRules merge_rules = create_merge_rules(target_vocab_size - 256);
-  train_bpe(&vocab, &seq, target_vocab_size, &merge_rules);
-  
   printf("\n\nSome learned tokens:\n");
   for (int i = 256; i < vocab.size && i < 280; i++) {
     printf("Token %d: ", i);
@@ -93,8 +111,10 @@ int main(int argc, char **argv) {
   }
   
   // Cleanup
-  free(text);
-  free_sequence(&seq);
+  if (text)
+    free(text);
+  if (seq_initialised)
+    free_sequence(&seq);
   free_sequence(&encoded);
   free(decoded);
   free_merge_rules(&merge_rules);

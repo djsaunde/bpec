@@ -1,4 +1,9 @@
 bpe
+interact
+
 input.txt
-.vscode
 openwebtext2/
+
+.vscode
+
+*.bin
